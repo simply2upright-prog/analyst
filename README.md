@@ -1,2 +1,2 @@
-# analyst
-Market Watch Daily
+# stockupdate
+Daily Update
