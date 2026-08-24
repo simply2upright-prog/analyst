@@ -10,7 +10,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from database import get_currency
 
-APP_URL = "https://stockupdate-65qjxum6gq2gpjpr5exqfd.streamlit.app"
+APP_URL = "https://analyst-qvzhar3rttdg8rghfaxw63.streamlit.app/"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
