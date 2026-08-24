@@ -14,7 +14,7 @@ from engine import (get_analysis, send_mail_report, classify_signal,
 from detail_engine import get_detail_analysis, compute_hit_rate
 from ticker_search import search_ticker, label_to_ticker, get_display_name
 
-APP_URL = "https://stockupdate-65qjxum6gq2gpjpr5exqfd.streamlit.app"
+APP_URL = "https://analyst-qvzhar3rttdg8rghfaxw63.streamlit.app/"
 
 # ─── PAGE CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="In8Invest Scanner", page_icon="📊", layout="wide")
