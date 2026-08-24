@@ -533,3 +533,20 @@ def get_all_groups() -> list:
 def get_ticker_count() -> int:
     """Gibt die Anzahl einzigartiger Ticker zurück."""
     return len(get_all_tickers())
+
+
+_TICKER_TO_GROUP = None
+
+def get_group_for_ticker(ticker: str) -> str | None:
+    """
+    Gibt die (erste) Gruppe zurück, in der ein Ticker geführt wird.
+    Wird für die Berechnung der relativen Stärke genutzt (Ticker vs.
+    Durchschnitt seiner Peer-Gruppe im selben Scan-Lauf).
+    """
+    global _TICKER_TO_GROUP
+    if _TICKER_TO_GROUP is None:
+        _TICKER_TO_GROUP = {}
+        for group, tickers in TICKER_LISTS.items():
+            for t in tickers:
+                _TICKER_TO_GROUP.setdefault(t, group)
+    return _TICKER_TO_GROUP.get(ticker)

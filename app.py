@@ -7,7 +7,7 @@ import base64
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from database import get_all_tickers, get_tickers_by_group, get_all_groups, get_currency, get_ticker_count
+from database import get_all_tickers, get_tickers_by_group, get_all_groups, get_currency, get_ticker_count, get_group_for_ticker
 from engine import (get_analysis, send_mail_report, classify_signal,
                     get_futures_analysis, FUTURES_TICKERS,
                     get_all_futures_groups, get_futures_by_group)
@@ -96,7 +96,15 @@ with tab1:
             prog.progress((i+1)/len(tickers))
         df = pd.DataFrame(raw)
         if not df.empty:
-            df = df[df["Score"] >= min_score].sort_values("Score", ascending=False).reset_index(drop=True)
+            # Relative Stärke: eigene 20-Tage-Performance vs. Durchschnitt der Peer-Gruppe in diesem Scan
+            df["_group"] = df["Ticker"].apply(get_group_for_ticker)
+            grp_avg = df.dropna(subset=["Ret_20d"]).groupby("_group")["Ret_20d"].mean()
+            df["RelStrength"] = df.apply(
+                lambda r: round(r["Ret_20d"] - grp_avg.get(r["_group"], np.nan), 2)
+                if pd.notna(r.get("Ret_20d")) and r["_group"] in grp_avg.index else None, axis=1)
+            df = df.drop(columns=["_group"])
+            df = df[df["Score"] >= min_score].sort_values(
+                ["Score","HitRate"], ascending=[False,False], na_position="last").reset_index(drop=True)
             st.session_state.results = df
             stat.success(f"✅ {len(df)} Signale in {len(tickers)} Titeln.")
         else:
@@ -105,6 +113,25 @@ with tab1:
     if not st.session_state.results.empty:
         df_show = st.session_state.results.copy()
         st.markdown("##### Ergebnisse — 🟢 OVERSOLD · 🔴 OVERBOUGHT · ⚪ NEUTRAL")
+
+        def _trend_html(t):
+            if t == "up":   return "<span style='color:#1a9e3f;font-weight:700'>📈</span>"
+            if t == "down": return "<span style='color:#c0392b;font-weight:700'>📉</span>"
+            return "<span style='color:#888'>–</span>"
+
+        def _hitrate_html(r):
+            hr, n = r.get('HitRate'), r.get('HitRate_N', 0)
+            if hr is None or (isinstance(hr, float) and pd.isna(hr)):
+                return f"<span style='color:#888;font-size:11px'>zu wenig ({int(n) if pd.notna(n) else 0})</span>"
+            color = "#0d7a2e" if hr >= 70 else ("#f39c12" if hr >= 50 else "#c0392b")
+            return f"<span style='color:{color};font-weight:700'>{int(hr)}%</span> <span style='color:#888;font-size:10px'>({int(n)})</span>"
+
+        def _relstrength_html(r):
+            rs = r.get('RelStrength')
+            if rs is None or (isinstance(rs, float) and pd.isna(rs)):
+                return "<span style='color:#888'>–</span>"
+            color = "#0d7a2e" if rs >= 0 else "#c0392b"
+            return f"<span style='color:{color};font-weight:700'>{rs:+.1f}%</span>"
 
         def _row_html(r):
             sv, sf, ss, cv = r.get('StochRSI'), r.get('Stoch_Fast'), r.get('Stoch_Slow'), r.get('CCI')
@@ -121,6 +148,9 @@ with tab1:
                     f"<td style='text-align:center'>{_ind_badge(ss,25,75,'{:.1f}')}</td>"
                     f"<td style='text-align:center'>{_ind_badge(cv,-100,100,'{:.1f}',invert=True)}</td>"
                     f"<td style='text-align:center;font-size:11px'>{_macd_badge(macd_turn)}</td>"
+                    f"<td style='text-align:center'>{_trend_html(r.get('Trend'))}</td>"
+                    f"<td style='text-align:center'>{_hitrate_html(r)}</td>"
+                    f"<td style='text-align:center'>{_relstrength_html(r)}</td>"
                     f"<td style='text-align:center'><span style='background:{sc_c};color:#fff;"
                     f"padding:2px 8px;border-radius:10px;font-weight:700'>{sc}/4</span></td>"
                     f"<td>{r.get('Div','')}</td><td>{r.get('KGV','')}</td>"
@@ -129,7 +159,7 @@ with tab1:
         thead = """<thead style='background:#1e2235;color:#8892a4;font-size:11px;text-transform:uppercase;letter-spacing:.5px'>
           <tr><th style='padding:10px 8px'>Ticker</th><th>Name</th><th>Signal</th><th>Preis</th>
           <th>StochRSI</th><th>Stoch F</th><th>Stoch S</th><th>CCI</th><th>MACD</th>
-          <th>Score</th><th>Div</th><th>KGV</th></tr></thead>"""
+          <th>Trend</th><th>Trefferquote</th><th>Rel. Stärke</th><th>Score</th><th>Div</th><th>KGV</th></tr></thead>"""
         tbody = "".join(_row_html(r) for _, r in df_show.iterrows())
         st.markdown(
             f"<div style='overflow-x:auto'><table style='border-collapse:collapse;width:100%;"
@@ -212,7 +242,12 @@ with tab2:
                 unsafe_allow_html=True)
             ib3.markdown(f"**CCI(20)** &nbsp; {_ind_badge(data['CCI'],-100,100,'{:.1f}',invert=True)}", unsafe_allow_html=True)
             ib4.markdown(f"**MACD(70,200,9)** &nbsp; {_macd_badge(data.get('MACD_Turn'))}", unsafe_allow_html=True)
-            st.markdown(f"<span style='color:#888;font-size:12px'>Z-Score: {_ind_badge(data['Z_Score'],-1.5,1.5,'{:.2f}')}</span>", unsafe_allow_html=True)
+            trend_txt = {"up":"📈 Aufwärtstrend (Kurs > SMA200)","down":"📉 Abwärtstrend (Kurs < SMA200) — Vorsicht bei Käufen"}.get(data.get('Trend'), "Trend n/a")
+            trend_col = {"up":"#0d7a2e","down":"#c0392b"}.get(data.get('Trend'), "#888")
+            st.markdown(
+                f"<span style='color:{trend_col};font-weight:700;font-size:12px'>{trend_txt}</span> &nbsp;·&nbsp; "
+                f"<span style='color:#888;font-size:12px'>Z-Score: {_ind_badge(data['Z_Score'],-1.5,1.5,'{:.2f}')}</span>",
+                unsafe_allow_html=True)
 
             # ── HAUPT-CHART (6 Panels) ─────────────────────────────
             df_full = data["df"]
@@ -602,21 +637,21 @@ with tab3:
                     entries  = res.get("Entry_Signals", [])
 
                     b_score = t_score = 0
-                    if res["Z_Score"] < -1.5: b_score += 15
-                    if res["Z_Score"] < -2.0: b_score += 15
-                    if res["RVOL"]    > 1.3:  b_score += 10
-                    if res["RVOL"]    > 2.0:  b_score += 15
+                    zsc, rvol = res.get("Z_Score"), res.get("RVOL")
+                    if zsc is not None:
+                        if zsc < -1.5: b_score += 15
+                        if zsc < -2.0: b_score += 15
+                        if zsc > 1.5:  t_score += 15
+                        if zsc > 2.0:  t_score += 15
+                    if rvol is not None:
+                        if rvol > 1.3: b_score += 10
+                        if rvol > 2.0: b_score += 15; t_score += 15
                     for p in patterns:
                         if "Selling Climax" in p:  b_score += 30
                         if "Doppelboden"    in p:  b_score += 20
                         if "Dreifachboden"  in p:  b_score += 25
                         if "Umgekehrte SKS" in p:  b_score += 25
                         if "V-Boden"        in p:  b_score += 15
-
-                    if res["Z_Score"] > 1.5: t_score += 15
-                    if res["Z_Score"] > 2.0: t_score += 15
-                    if res["RVOL"]    > 2.0: t_score += 15
-                    for p in patterns:
                         if "Buying Climax" in p:   t_score += 30
                         if "Doppeltop"     in p:   t_score += 20
                         if "SKS-Formation" in p:   t_score += 25
@@ -687,19 +722,24 @@ with tab3:
 
                 b_score = t_score = 0
                 b_reasons = []; t_reasons = []
-                if data["Z_Score"] < -2.0: b_score += 30; b_reasons.append(f"📏 Z-Score {data['Z_Score']:.2f}")
-                elif data["Z_Score"] < -1.5: b_score += 15
-                if data["RVOL"]    > 2.0:  b_score += 25; b_reasons.append(f"📊 RVOL {data['RVOL']:.2f}x")
-                elif data["RVOL"]  > 1.3:  b_score += 10
+                zsc, rvol = data.get("Z_Score"), data.get("RVOL")
+                if zsc is not None:
+                    if zsc < -2.0: b_score += 30; b_reasons.append(f"📏 Z-Score {zsc:.2f}")
+                    elif zsc < -1.5: b_score += 15
+                if rvol is not None:
+                    if rvol > 2.0:  b_score += 25; b_reasons.append(f"📊 RVOL {rvol:.2f}x")
+                    elif rvol > 1.3:  b_score += 10
                 for p in patterns:
                     if "Selling Climax" in p: b_score += 30; b_reasons.append("🚨 Selling Climax")
                     if "Doppelboden"    in p: b_score += 20; b_reasons.append("📐 Doppelboden")
                     if "Dreifachboden"  in p: b_score += 25; b_reasons.append("📐 Dreifachboden")
                     if "Umgekehrte SKS" in p: b_score += 25; b_reasons.append("📐 Inverse SKS")
                     if "V-Boden"        in p: b_score += 15; b_reasons.append("📐 V-Boden")
-                if data["Z_Score"] > 2.0:  t_score += 30; t_reasons.append(f"📏 Z-Score {data['Z_Score']:.2f}")
-                elif data["Z_Score"] > 1.5:t_score += 15
-                if data["RVOL"]    > 2.0:  t_score += 15; t_reasons.append(f"📊 RVOL {data['RVOL']:.2f}x")
+                if zsc is not None:
+                    if zsc > 2.0:  t_score += 30; t_reasons.append(f"📏 Z-Score {zsc:.2f}")
+                    elif zsc > 1.5: t_score += 15
+                if rvol is not None and rvol > 2.0:
+                    t_score += 15; t_reasons.append(f"📊 RVOL {rvol:.2f}x")
                 for p in patterns:
                     if "Buying Climax" in p: t_score += 30; t_reasons.append("🚨 Buying Climax")
                     if "Doppeltop"     in p: t_score += 20; t_reasons.append("📐 Doppeltop")

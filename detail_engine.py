@@ -5,7 +5,8 @@ import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
 from database import get_currency
-from engine import classify_signal, clean_price_df, compute_macd, detect_macd_turn, format_dividend_yield
+from engine import (classify_signal, clean_price_df, compute_macd, detect_macd_turn,
+                     format_dividend_yield, find_signal_history, find_entry_signals, compute_hit_rate)
 
 
 def _fetch_history(ticker: str):
@@ -35,10 +36,10 @@ def get_detail_analysis(ticker: str) -> dict | None:
         rsi_r = (df['RSI_70'].rolling(rsi_w).max() - df['RSI_70'].rolling(rsi_w).min()).replace(0, np.nan)
         df['StochRSI_70'] = (df['RSI_70'] - df['RSI_70'].rolling(rsi_w).min()) / rsi_r
 
-        w14 = min(14, len(df)-1)
-        hl  = (df['High'].rolling(w14).max() - df['Low'].rolling(w14).min()).replace(0, np.nan)
-        df['Stoch_Fast'] = 100 * (df['Close'] - df['Low'].rolling(w14).min()) / hl
-        df['Stoch_Slow'] = df['Stoch_Fast'].rolling(7).mean()
+        w70 = min(70, len(df)-1)
+        hl  = (df['High'].rolling(w70).max() - df['Low'].rolling(w70).min()).replace(0, np.nan)
+        df['Stoch_Fast'] = 100 * (df['Close'] - df['Low'].rolling(w70).min()) / hl
+        df['Stoch_Slow'] = df['Stoch_Fast'].rolling(7).mean()   # Stoch(70,7,1): Slow = 7er-Glättung von Fast
 
         tp   = (df['High'] + df['Low'] + df['Close']) / 3
         mdev = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
@@ -60,8 +61,8 @@ def get_detail_analysis(ticker: str) -> dict | None:
 
         # ── Muster, Ziele, historische Marker ─────────────────────
         patterns, targets = _detect_patterns_and_targets(df)
-        signal_history    = _find_signal_history(df)
-        entry_signals     = _find_entry_signals(df)
+        signal_history    = find_signal_history(df)
+        entry_signals     = find_entry_signals(df)
 
         def _s(v, d=3):
             try:
@@ -75,14 +76,16 @@ def get_detail_analysis(ticker: str) -> dict | None:
         s_slow        = _s(df['Stoch_Slow'].iloc[-1], 1)
         cci_val       = _s(df['CCI_20'].iloc[-1], 1)
 
-        # Score /4: die 3 Extremwert-Kriterien + MACD-Umkehr als eigentlicher Trigger
-        score = 0
-        if stoch_rsi_val is not None and 0 < stoch_rsi_val < 0.1:                         score += 1
-        if s_fast is not None and s_slow is not None and s_fast < 20 and s_slow < 25:     score += 1
-        if cci_val is not None and cci_val > -100:                                        score += 1
-        if macd_turn == "up":                                                             score += 1
+        # Score UND Label kommen aus derselben Kriterien-Auswertung (evaluate_criteria
+        # in engine.py) - keine getrennt berechneten, potenziell abweichenden Schwellen mehr.
+        sig   = classify_signal(stoch_rsi_val, s_fast, s_slow, cci_val, macd_turn)
+        score = sig["buy_score"] if sig["buy_score"] >= sig["sell_score"] else sig["sell_score"]
 
-        sig = classify_signal(stoch_rsi_val, s_fast, s_slow, cci_val, macd_turn)
+        # Trendfilter: Kurs vs. SMA/EMA200 (Warnung vor "überverkauft im freien Fall")
+        sma200_val = df['SMA200'].iloc[-1] if 'SMA200' in df.columns else np.nan
+        trend = None
+        if pd.notna(sma200_val):
+            trend = "up" if price > sma200_val else "down"
 
         inf = {}
         try: inf = stock.info or {}
@@ -111,6 +114,7 @@ def get_detail_analysis(ticker: str) -> dict | None:
             "Z_Score":        _s(df['Z_Score'].iloc[-1], 2),
             "RVOL":           _s(df['RVOL'].iloc[-1], 2),
             "MACD_Turn":      macd_turn,
+            "Trend":          trend,
             "MACD":           _s(df['MACD'].iloc[-1], 3),
             "MACD_Signal":    _s(df['SIGNAL'].iloc[-1], 3),
             "MACD_Hist":      _s(df['OSMA'].iloc[-1], 3),
@@ -126,235 +130,6 @@ def get_detail_analysis(ticker: str) -> dict | None:
         print(f"[detail_engine] {ticker}: {e}")
         return None
 
-
-def _macd_turn_at(df: pd.DataFrame, i: int, lookback: int = 3) -> str | None:
-    """Wie detect_macd_turn(), aber für eine beliebige Position i im DataFrame (Backtest)."""
-    if "OSMA" not in df.columns or i < lookback + 1:
-        return None
-    h = df["OSMA"].iloc[i - lookback - 1 : i + 1].values
-    if len(h) < lookback + 2 or np.any(np.isnan(h)):
-        return None
-    was_falling = all(h[j] < h[j-1] for j in range(1, len(h)-1))
-    turns_up    = h[-1] > h[-2]
-    was_rising  = all(h[j] > h[j-1] for j in range(1, len(h)-1))
-    turns_down  = h[-1] < h[-2]
-    if was_falling and turns_up:   return "up"
-    if was_rising and turns_down:  return "down"
-    return None
-
-
-def _find_signal_history(df: pd.DataFrame) -> list[dict]:
-    """
-    Findet alle historischen Momente, an denen die Scanner-Kriterien
-    (StochRSI < 0.1, Stoch Fast < 20, CCI > -100, MACD-Umkehr) erfüllt waren.
-    Gibt Liste von {date, price, stochrsi, cci, macd_turn, score} zurück.
-    """
-    hits = []
-    if len(df) < 20:
-        return hits
-
-    for i in range(len(df)):
-        row = df.iloc[i]
-        sr  = row.get('StochRSI_70', np.nan)
-        sf  = row.get('Stoch_Fast',  np.nan)
-        ss  = row.get('Stoch_Slow',  np.nan)
-        cv  = row.get('CCI_20',      np.nan)
-
-        if any(pd.isna(x) for x in [sr, sf, ss, cv]):
-            continue
-
-        macd_turn = _macd_turn_at(df, i)
-
-        sc = 0
-        if 0 < float(sr) < 0.1:                         sc += 1
-        if float(sf) < 20 and float(ss) < 25:            sc += 1
-        if float(cv) > -100:                             sc += 1
-        if macd_turn == "up":                            sc += 1
-
-        if sc >= 2:
-            hits.append({
-                "date":      df.index[i],
-                "price":     round(float(row['Close']), 2),
-                "StochRSI":  round(float(sr), 3),
-                "CCI":       round(float(cv), 1),
-                "MACD_Turn": macd_turn,
-                "score":     sc,
-            })
-
-    # Cluster zusammenfassen: nur erste Treffer pro Cluster (min 10 Tage Abstand)
-    clustered = []
-    last_date = None
-    for h in hits:
-        if last_date is None or (h["date"] - last_date).days >= 10:
-            clustered.append(h)
-            last_date = h["date"]
-
-    return clustered
-
-
-def _find_entry_signals(df: pd.DataFrame) -> list[dict]:
-    """
-    Einstiegszeitpunkt-Logik:
-    Kriterien waren erfüllt → warte auf Bestätigung. Zwei mögliche Trigger,
-    es zählt was zuerst eintritt:
-      (a) MACD-Histogramm dreht nach oben (der eigentliche Trigger der Strategie)
-      (b) Ersatzweise: Kurs steigt > 2% über lokales Tief (falls MACD im Fenster nicht dreht)
-    Gibt konkrete Einstiegssignale mit Datum, Preis, Trigger-Art und Vorlauf zurück.
-    Mehrere Signal-Daten, die auf denselben Bestätigungstag laufen, werden zu
-    EINEM Trade zusammengefasst (sonst wird derselbe Trade in der Trefferquote
-    mehrfach gezählt und die Quote künstlich aufgebläht).
-    """
-    entries = []
-    signal_hits = _find_signal_history(df)
-
-    for hit in signal_hits:
-        try:
-            hit_idx = df.index.get_loc(hit["date"])
-            window  = df.iloc[hit_idx: min(hit_idx + 21, len(df))]
-            if len(window) < 3:
-                continue
-
-            local_low = float(window['Low'].min())
-            low_date  = window['Low'].idxmin()
-            low_idx   = window.index.get_loc(low_date) if hasattr(window.index, 'get_loc') else 0
-            confirm_window = window.iloc[low_idx:]
-
-            # (a) MACD-Umkehr im Fenster suchen
-            macd_confirm_date = None
-            for j in range(hit_idx, min(hit_idx + 21, len(df))):
-                if _macd_turn_at(df, j) == "up":
-                    macd_confirm_date = df.index[j]
-                    break
-
-            # (b) Preis-Bestätigung als Ersatz
-            price_confirm_rows = confirm_window[confirm_window['Close'] > local_low * 1.02]
-            price_confirm_date = price_confirm_rows.index[0] if not price_confirm_rows.empty else None
-
-            candidates = [(d, "MACD") for d in [macd_confirm_date] if d is not None] + \
-                         [(d, "Preis") for d in [price_confirm_date] if d is not None]
-            if not candidates:
-                continue
-            confirm_date, trigger = min(candidates, key=lambda t: t[0])
-            confirm_price = round(float(df.loc[confirm_date, 'Close']), 2)
-            days_to_entry = (confirm_date - hit["date"]).days
-
-            entries.append({
-                "signal_date":    hit["date"],
-                "signal_price":   hit["price"],
-                "entry_date":     confirm_date,
-                "entry_price":    confirm_price,
-                "local_low":      round(local_low, 2),
-                "days_to_entry":  days_to_entry,
-                "upside_pct":     round((confirm_price - local_low) / local_low * 100, 1),
-                "trigger":        trigger,
-            })
-        except Exception:
-            continue
-
-    # Dedupe: mehrere Signale, die zum selben Einstiegstag führen, zählen nur einmal
-    # (sonst wird derselbe Trade in der Trefferquote doppelt gewertet)
-    entries.sort(key=lambda e: e["signal_date"])
-    seen_entry_dates = set()
-    deduped = []
-    for e in entries:
-        if e["entry_date"] in seen_entry_dates:
-            continue
-        seen_entry_dates.add(e["entry_date"])
-        deduped.append(e)
-
-    return deduped
-
-
-def compute_hit_rate(entry_signals: list[dict], df: pd.DataFrame, forward_days: int = 40) -> dict:
-    """
-    Berechnet für jedes historische Einstiegssignal, ob danach eine
-    echte Trendwende stattgefunden hat.
-    
-    Kriterium Trendwende: Kurs stieg innerhalb von `forward_days` Tagen
-    um mind. 5% über den Einstiegspreis.
-    
-    Gibt zurück:
-    {
-      "total": int,
-      "hits": int,           # echte Bodenbildung bestätigt
-      "misses": int,         # kein Anstieg >5%
-      "rate": float,         # 0.0–1.0
-      "details": list[dict]  # pro Signal: date, entry_price, result, max_gain_pct
-    }
-    """
-    if not entry_signals or df.empty:
-        return {"total": 0, "hits": 0, "misses": 0, "rate": 0.0, "details": []}
-
-    hits   = 0
-    misses = 0
-    details = []
-    # Wir brauchen mind. forward_days Zukunftsdaten → letzte Signale ausschließen
-    cutoff = df.index[-forward_days] if len(df) > forward_days else df.index[0]
-
-    for e in entry_signals:
-        entry_date  = e["entry_date"]
-        entry_price = e["entry_price"]
-
-        # Signal zu nah am Ende → kein Forward-Window
-        try:
-            if entry_date > cutoff:
-                details.append({
-                    "entry_date":  entry_date,
-                    "entry_price": entry_price,
-                    "result":      "⏳ Zu Neu",
-                    "result_code": "new",
-                    "max_gain_pct": None,
-                })
-                continue
-
-            fwd_data = df[df.index > entry_date].head(forward_days)
-            if fwd_data.empty:
-                continue
-
-            max_close   = float(fwd_data["Close"].max())
-            max_gain    = round((max_close - entry_price) / entry_price * 100, 1) if entry_price else 0
-            min_close   = float(fwd_data["Close"].min())
-            max_loss    = round((min_close - entry_price) / entry_price * 100, 1) if entry_price else 0
-
-            # Bewertung
-            if max_gain >= 10:
-                result = "✅ Starke Wende"
-                result_code = "strong"
-                hits += 1
-            elif max_gain >= 5:
-                result = "🟡 Schwache Wende"
-                result_code = "weak"
-                hits += 1
-            elif max_loss < -5 and max_gain < 3:
-                result = "❌ Kein Boden"
-                result_code = "fail"
-                misses += 1
-            else:
-                result = "⚠️ Seitwärts"
-                result_code = "sideways"
-                misses += 1
-
-            details.append({
-                "entry_date":   entry_date,
-                "entry_price":  entry_price,
-                "result":       result,
-                "result_code":  result_code,
-                "max_gain_pct": max_gain,
-                "max_loss_pct": max_loss,
-            })
-        except Exception:
-            continue
-
-    total = hits + misses
-    rate  = round(hits / total, 2) if total > 0 else 0.0
-
-    return {
-        "total":   total,
-        "hits":    hits,
-        "misses":  misses,
-        "rate":    rate,
-        "details": details,
-    }
 
 
 def _detect_patterns_and_targets(df: pd.DataFrame) -> tuple[list, dict]:
