@@ -14,7 +14,7 @@ from engine import (get_analysis, send_mail_report, classify_signal,
 from detail_engine import get_detail_analysis, compute_hit_rate
 from ticker_search import search_ticker, label_to_ticker, get_display_name
 
-APP_URL = "https://analyst-qvzhar3rttdg8rghfaxw63.streamlit.app/"
+APP_URL = "https://stockupdate-65qjxum6gq2gpjpr5exqfd.streamlit.app"
 
 # ─── PAGE CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="In8Invest Scanner", page_icon="📊", layout="wide")
@@ -176,9 +176,13 @@ with tab2:
 
     # ── Suchfeld mit Name-Suche ─────────────────────────────────────────────
     # Deep-Link aus Email: ?ticker=ALV.DE
+    # WICHTIG: hier den reinen Ticker vorbefüllen, nicht das kombinierte
+    # "TICKER — Name"-Label (get_display_name) - search_ticker() erwartet
+    # entweder nur Ticker oder nur Name als Suchbegriff, nicht beides
+    # zusammen mit " — " verbunden, sonst matcht die Suche nichts.
     if deep_link_ticker and deep_link_ticker in all_t:
         if "search_query" not in st.session_state:
-            st.session_state["search_query"] = get_display_name(deep_link_ticker)
+            st.session_state["search_query"] = deep_link_ticker
 
     search_q = st.text_input(
         "🔍 Aktie suchen (Name, Ticker, Alias):",
@@ -198,7 +202,15 @@ with tab2:
         st.warning(f"Keine Treffer für **{search_q}** — bitte Ticker direkt eingeben (z.B. ALV.DE)")
         suggestions = [get_display_name(t) for t in all_t[:5]]
 
-    sel_label = st.selectbox("Ergebnisse:", suggestions, key="det_t_label")
+    # Deep-Link: falls der verlinkte Ticker unter den Vorschlägen ist, aber
+    # nicht an erster Stelle steht, trotzdem automatisch vorauswählen.
+    default_idx = 0
+    if deep_link_ticker:
+        deep_label = get_display_name(deep_link_ticker)
+        if deep_label in suggestions:
+            default_idx = suggestions.index(deep_label)
+
+    sel_label = st.selectbox("Ergebnisse:", suggestions, index=default_idx, key="det_t_label")
     sel_t = label_to_ticker(sel_label)
 
     # Zeitraum-Auswahl — Standard 6 Monate
