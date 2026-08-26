@@ -10,7 +10,8 @@ from plotly.subplots import make_subplots
 from database import get_all_tickers, get_tickers_by_group, get_all_groups, get_currency, get_ticker_count, get_group_for_ticker
 from engine import (get_analysis, send_mail_report, classify_signal,
                     get_futures_analysis, FUTURES_TICKERS,
-                    get_all_futures_groups, get_futures_by_group)
+                    get_all_futures_groups, get_futures_by_group,
+                    analyze_trend_hit_rate)
 from detail_engine import get_detail_analysis, compute_hit_rate
 from ticker_search import search_ticker, label_to_ticker, get_display_name
 
@@ -840,9 +841,73 @@ with tab3:
                     yaxis=dict(title=f"Preis ({cur})",showgrid=True,gridcolor="#2d333b"))
                 st.plotly_chart(fig_vp, use_container_width=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — ROHSTOFFE & FUTURES
-# ══════════════════════════════════════════════════════════════════════════════
+    # ── NEU: Trend-Vergleichsauswertung ─────────────────────────────
+    # Beantwortet: "Hätte der Trendfilter (Kurs vs. SMA200) historisch
+    # tatsächlich vor schlechteren Trades gewarnt?" - über alle historischen
+    # Einstiegssignale (letzte 2 Jahre) einer Ticker-Gruppe hinweg.
+    st.divider()
+    st.markdown("### 📊 Trend-Vergleich: Trefferquote mit vs. ohne Aufwärtstrend")
+    st.caption(
+        "Sammelt alle historischen Einstiegssignale (Score ≥ 2, letzte 2 Jahre) einer Ticker-Gruppe "
+        "und vergleicht die Trefferquote danach, ob der Kurs zum jeweiligen Einstiegszeitpunkt über "
+        "(Aufwärtstrend) oder unter (Abwärtstrend) der SMA200 lag."
+    )
+    grp_tv = st.selectbox("Gruppe:", ["🌍 Alle Gruppen"] + get_all_groups(), key="trend_vgl_grp")
+    st.caption("⚠️ Bei 'Alle Gruppen' (838 Ticker) dauert der Lauf mehrere Minuten, da für jeden Ticker "
+               "2 Jahre Historie geladen und ausgewertet werden.")
+
+    if st.button("📊 Trend-Vergleich starten", key="trend_vgl_btn"):
+        tickers_tv = get_all_tickers() if grp_tv == "🌍 Alle Gruppen" else get_tickers_by_group(grp_tv)
+        prog_tv, txt_tv = st.progress(0), st.empty()
+
+        def _tv_progress(i, n, ticker):
+            txt_tv.text(f"Werte aus: {i+1}/{n} ({ticker})")
+            prog_tv.progress((i + 1) / n)
+
+        with st.spinner("Historische Einstiegssignale werden gesammelt und ausgewertet …"):
+            tv_result = analyze_trend_hit_rate(tickers_tv, progress_cb=_tv_progress)
+        txt_tv.empty(); prog_tv.empty()
+
+        up, down, unknown = tv_result["up"], tv_result["down"], tv_result["unknown"]
+        st.success(f"✅ Ausgewertet über {tv_result['n_tickers_used']} Ticker mit historischen Signalen.")
+
+        c_up, c_down = st.columns(2)
+        with c_up:
+            st.markdown("#### 📈 Einstieg im Aufwärtstrend")
+            if up["total_trades"] > 0:
+                st.metric("Trefferquote", f"{up['hit_rate']}%", help=f"{up['hits']} von {up['total_trades']} Trades")
+                st.metric("Ø max. Gewinn", f"+{up['avg_max_gain']}%" if up['avg_max_gain'] is not None else "N/A")
+                st.metric("Ø max. Verlust", f"{up['avg_max_loss']}%" if up['avg_max_loss'] is not None else "N/A")
+                st.caption(f"{up['total_trades']} Trades gesamt")
+            else:
+                st.info("Keine Trades in dieser Kohorte gefunden.")
+        with c_down:
+            st.markdown("#### 📉 Einstieg im Abwärtstrend")
+            if down["total_trades"] > 0:
+                st.metric("Trefferquote", f"{down['hit_rate']}%", help=f"{down['hits']} von {down['total_trades']} Trades")
+                st.metric("Ø max. Gewinn", f"+{down['avg_max_gain']}%" if down['avg_max_gain'] is not None else "N/A")
+                st.metric("Ø max. Verlust", f"{down['avg_max_loss']}%" if down['avg_max_loss'] is not None else "N/A")
+                st.caption(f"{down['total_trades']} Trades gesamt")
+            else:
+                st.info("Keine Trades in dieser Kohorte gefunden.")
+
+        if up["total_trades"] > 0 and down["total_trades"] > 0:
+            diff = up["hit_rate"] - down["hit_rate"]
+            if diff > 5:
+                st.success(f"📈 Bestätigt: Einstiege im Aufwärtstrend hatten historisch eine um "
+                           f"**{diff:.1f} Prozentpunkte höhere** Trefferquote. Der Trendfilter macht hier einen echten Unterschied.")
+            elif diff < -5:
+                st.warning(f"🤔 Überraschend: Einstiege im Abwärtstrend hatten historisch sogar eine um "
+                           f"**{-diff:.1f} Prozentpunkte höhere** Trefferquote (\"Rebound-Effekt\"). "
+                           f"Der Trendfilter sollte hier mit Vorsicht interpretiert werden.")
+            else:
+                st.info(f"➖ Kaum Unterschied ({diff:+.1f} Prozentpunkte) zwischen den beiden Kohorten in dieser Auswertung.")
+
+        if unknown["total_trades"] > 0:
+            st.caption(f"ℹ️ {unknown['total_trades']} weitere Trades ohne verwertbaren SMA200-Wert "
+                       f"(z.B. zu junge Aktien) wurden als 'unbekannt' separat gezählt, nicht in den Vergleich einbezogen.")
+
+
 with tab4:
     st.header("🛢️ Rohstoffe, Energie & Futures")
     st.caption("Futures via Yahoo Finance. Preise in USD sofern nicht anders angegeben.")

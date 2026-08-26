@@ -10,7 +10,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from database import get_currency
 
-APP_URL = "https://analyst-qvzhar3rttdg8rghfaxw63.streamlit.app/"
+APP_URL = "https://stockupdate-65qjxum6gq2gpjpr5exqfd.streamlit.app"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,13 +225,23 @@ def find_entry_signals(df: pd.DataFrame, rsi_col="StochRSI_70", cci_col="CCI_20"
             confirm_date, trigger = min(candidates, key=lambda t: t[0])
             confirm_price = round(float(df.loc[confirm_date, 'Close']), 2)
 
+            # Trend zum EINSTIEGSZEITPUNKT (nicht heute!) - Kern der
+            # Trend-Vergleichsauswertung: hätte der Trendfilter damals schon
+            # vor einer schlechteren Trefferquote gewarnt?
+            trend_at_entry = None
+            if 'SMA200' in df.columns:
+                sma_then = df.loc[confirm_date, 'SMA200']
+                if pd.notna(sma_then):
+                    trend_at_entry = "up" if confirm_price > sma_then else "down"
+
             entries.append({
-                "signal_date":   hit["date"], "signal_price": hit["price"],
-                "entry_date":    confirm_date, "entry_price":  confirm_price,
-                "local_low":     round(local_low, 2),
-                "days_to_entry": (confirm_date - hit["date"]).days,
-                "upside_pct":    round((confirm_price - local_low) / local_low * 100, 1),
-                "trigger":       trigger,
+                "signal_date":    hit["date"], "signal_price": hit["price"],
+                "entry_date":     confirm_date, "entry_price":  confirm_price,
+                "local_low":      round(local_low, 2),
+                "days_to_entry":  (confirm_date - hit["date"]).days,
+                "upside_pct":     round((confirm_price - local_low) / local_low * 100, 1),
+                "trigger":        trigger,
+                "trend_at_entry": trend_at_entry,
             })
         except Exception:
             continue
@@ -258,10 +268,12 @@ def compute_hit_rate(entry_signals: list[dict], df: pd.DataFrame, forward_days: 
 
     for e in entry_signals:
         entry_date, entry_price = e["entry_date"], e["entry_price"]
+        trend_at_entry = e.get("trend_at_entry")
         try:
             if entry_date > cutoff:
                 details.append({"entry_date": entry_date, "entry_price": entry_price,
-                                 "result": "⏳ Zu Neu", "result_code": "new", "max_gain_pct": None})
+                                 "result": "⏳ Zu Neu", "result_code": "new", "max_gain_pct": None,
+                                 "trend_at_entry": trend_at_entry})
                 continue
             fwd_data = df[df.index > entry_date].head(forward_days)
             if fwd_data.empty:
@@ -281,7 +293,8 @@ def compute_hit_rate(entry_signals: list[dict], df: pd.DataFrame, forward_days: 
                 result, result_code = "⚠️ Seitwärts", "sideways"; misses += 1
 
             details.append({"entry_date": entry_date, "entry_price": entry_price, "result": result,
-                             "result_code": result_code, "max_gain_pct": max_gain, "max_loss_pct": max_loss})
+                             "result_code": result_code, "max_gain_pct": max_gain, "max_loss_pct": max_loss,
+                             "trend_at_entry": trend_at_entry})
         except Exception:
             continue
 
@@ -293,6 +306,107 @@ def compute_hit_rate(entry_signals: list[dict], df: pd.DataFrame, forward_days: 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCANNER ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
+
+def add_strategy_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Berechnet alle Indikatoren der Strategie auf einem OHLCV-DataFrame:
+    StochRSI(70), Stoch Fast/Slow(70,7-Glättung), CCI(20), MACD(70,200,9), SMA200.
+    Gemeinsam genutzt von get_analysis() (Live-Scan) und analyze_trend_hit_rate()
+    (historische Auswertung) - eine Berechnung, keine Abweichungen zwischen beiden.
+    """
+    has_70  = len(df) >= 70
+    has_200 = len(df) >= 200
+    rsi_w   = 70 if has_70 else 14
+
+    delta = df['Close'].diff()
+    gain  = delta.where(delta > 0, 0.0).rolling(rsi_w).mean()
+    loss  = (-delta.where(delta < 0, 0.0)).rolling(rsi_w).mean()
+    df['RSI'] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+    rsi_r     = (df['RSI'].rolling(rsi_w).max() - df['RSI'].rolling(rsi_w).min()).replace(0, np.nan)
+    df['StochRSI_70'] = (df['RSI'] - df['RSI'].rolling(rsi_w).min()) / rsi_r
+
+    hl_f   = (df['High'].rolling(70).max() - df['Low'].rolling(70).min()).replace(0, np.nan)
+    df['Stoch_Fast'] = 100 * (df['Close'] - df['Low'].rolling(70).min()) / hl_f
+    df['Stoch_Slow'] = df['Stoch_Fast'].rolling(7).mean()   # Stoch(70,7,1): Slow = 7er-Glättung von Fast
+
+    tp   = (df['High'] + df['Low'] + df['Close']) / 3
+    mdev = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    df['CCI_20'] = (tp - tp.rolling(20).mean()) / (0.015 * mdev.replace(0, np.nan))
+
+    df = compute_macd(df, fast=70 if has_70 else 12, slow=200 if has_200 else 26, signal=9)
+
+    # Trendfilter: Kurs vs. SMA200
+    df['SMA200'] = df['Close'].rolling(min(200, len(df)-1)).mean()
+    return df
+
+
+def analyze_trend_hit_rate(tickers: list[str], progress_cb=None, forward_days: int = 40) -> dict:
+    """
+    Läuft über eine Ticker-Liste, sammelt ALLE historischen Einstiegssignale
+    (Score >= 2, letzte 2 Jahre) und vergleicht die Trefferquote danach, ob
+    der Kurs zum jeweiligen EINSTIEGSZEITPUNKT über (Aufwärtstrend) oder unter
+    (Abwärtstrend) der SMA200 lag. Beantwortet die Frage: "Hätte der eingebaute
+    Trendfilter historisch tatsächlich vor schlechteren Trades gewarnt?"
+
+    progress_cb(i, n, ticker): optionaler Callback für eine Fortschrittsanzeige.
+    Gibt {"up": {...}, "down": {...}, "unknown": {...}, "n_tickers_used": int} zurück.
+    """
+    cohorts = {
+        "up":      {"hits": 0, "misses": 0, "gains": [], "losses": []},
+        "down":    {"hits": 0, "misses": 0, "gains": [], "losses": []},
+        "unknown": {"hits": 0, "misses": 0, "gains": [], "losses": []},
+    }
+    n_tickers_used = 0
+    n = len(tickers)
+
+    for i, ticker in enumerate(tickers):
+        if progress_cb:
+            try: progress_cb(i, n, ticker)
+            except Exception: pass
+        try:
+            stock = yf.Ticker(ticker)
+            df = clean_price_df(stock.history(period="2y", auto_adjust=False))
+            if df.empty or len(df) < 60:
+                continue
+            df = add_strategy_indicators(df)
+
+            entries = find_entry_signals(df)
+            if not entries:
+                continue
+            hr = compute_hit_rate(entries, df, forward_days=forward_days)
+            if hr["total"] == 0:
+                continue
+
+            n_tickers_used += 1
+            for d in hr["details"]:
+                if d["result_code"] == "new":
+                    continue  # zu neu, noch kein Ergebnis bekannt
+                trend = d.get("trend_at_entry") or "unknown"
+                c = cohorts[trend]
+                if d["result_code"] in ("strong", "weak"):
+                    c["hits"] += 1
+                else:
+                    c["misses"] += 1
+                if d.get("max_gain_pct") is not None:
+                    c["gains"].append(d["max_gain_pct"])
+                if d.get("max_loss_pct") is not None:
+                    c["losses"].append(d["max_loss_pct"])
+        except Exception:
+            continue
+
+    summary = {"n_tickers_used": n_tickers_used}
+    for key, c in cohorts.items():
+        total = c["hits"] + c["misses"]
+        summary[key] = {
+            "total_trades": total,
+            "hits":         c["hits"],
+            "misses":       c["misses"],
+            "hit_rate":     round(c["hits"] / total * 100, 1) if total > 0 else None,
+            "avg_max_gain": round(float(np.mean(c["gains"])), 1) if c["gains"] else None,
+            "avg_max_loss": round(float(np.mean(c["losses"])), 1) if c["losses"] else None,
+        }
+    return summary
+
 
 def get_analysis(ticker: str, retries: int = 2, compute_history: bool = True) -> dict | None:
     """
@@ -308,31 +422,9 @@ def get_analysis(ticker: str, retries: int = 2, compute_history: bool = True) ->
             if df.empty or len(df) < 50:
                 return None
 
-            has_70  = len(df) >= 70
-            has_200 = len(df) >= 200
-            rsi_w   = 70 if has_70 else 14
-
-            delta = df['Close'].diff()
-            gain  = delta.where(delta > 0, 0.0).rolling(rsi_w).mean()
-            loss  = (-delta.where(delta < 0, 0.0)).rolling(rsi_w).mean()
-            df['RSI'] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
-            rsi_r     = (df['RSI'].rolling(rsi_w).max() - df['RSI'].rolling(rsi_w).min()).replace(0, np.nan)
-            df['StochRSI_70'] = (df['RSI'] - df['RSI'].rolling(rsi_w).min()) / rsi_r
-
-            slow_w = 200 if has_200 else 70
-            hl_f   = (df['High'].rolling(70).max() - df['Low'].rolling(70).min()).replace(0, np.nan)
-            df['Stoch_Fast'] = 100 * (df['Close'] - df['Low'].rolling(70).min()) / hl_f
-            df['Stoch_Slow'] = df['Stoch_Fast'].rolling(7).mean()   # Stoch(70,7,1): Slow = 7er-Glättung von Fast
-
-            tp   = (df['High'] + df['Low'] + df['Close']) / 3
-            mdev = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
-            df['CCI_20'] = (tp - tp.rolling(20).mean()) / (0.015 * mdev.replace(0, np.nan))
-
-            df = compute_macd(df, fast=70 if has_70 else 12, slow=200 if has_200 else 26, signal=9)
+            df = add_strategy_indicators(df)
             macd_turn = detect_macd_turn(df)
 
-            # Trendfilter: Kurs vs. SMA200 (vermeidet "überverkauft im freien Fall" als falsche Kaufchance)
-            df['SMA200'] = df['Close'].rolling(min(200, len(df)-1)).mean()
             sma200 = df['SMA200'].iloc[-1]
             trend  = None
             if pd.notna(sma200):
